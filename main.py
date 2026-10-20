@@ -7,21 +7,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Токен берем из переменных окружения BotHost (BOT_TOKEN или SPB_HELPER_TOKEN)
+# Токен и канал
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("SPB_HELPER_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+
 if not BOT_TOKEN:
     raise RuntimeError("[-] ОШИБКА: Не задана переменная окружения BOT_TOKEN!")
+if not CHANNEL_ID:
+    raise RuntimeError("[-] ОШИБКА: Не задана переменная окружения CHANNEL_ID!")
 
 BOT_TOKEN = BOT_TOKEN.strip()
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Фирменная подпись Дозора со ссылкой на канал СПб
+# Фирменная подпись Дозора
 FOOTER_HTML = (
     "\n\n📡 Дозор.ру | Питер и Ленинградская область - "
     "<a href='https://t.me/RadarLO_SPB'>Подписаться</a>"
 )
 
-# Шаблон чужих подписей, рекламных строк и ссылок в конце поста
+# Регулярки
 FOREIGN_FOOTER_LINE_RE = re.compile(
     r"@\w+|"
     r"https?://\S+|t\.me/\S+|max\.ru/\S+|clck\.ru/\S+|"
@@ -33,13 +37,13 @@ FOREIGN_FOOTER_LINE_RE = re.compile(
     re.IGNORECASE
 )
 
-# Чужие эмодзи в самом начале текста, которые нужно убрать перед постановкой кружка
 LEADING_SYMBOLS_RE = re.compile(
     r"^(?:[⚡️⚡❗️❕🔴🟡🟢⚪️⚪⚠️🚨💥🔥📢📌🔹🔸]+\s*)+"
 )
 
-# Память для хранения ожидающих выбора кружка сообщений: {prompt_msg_id: dict}
+# Память
 PENDING_POSTS = {}
+READY_POSTS = {}
 
 CIRCLE_MAP = {
     "circle_red": "🔴",
@@ -49,8 +53,28 @@ CIRCLE_MAP = {
     "circle_none": ""
 }
 
+def cleanup_memory():
+    """Очищает старые записи, чтобы память не переполнялась."""
+    now = time.time()
+    cutoff = now - 3600  # 1 час
+    
+    if len(PENDING_POSTS) > 200:
+        for k in [k for k, v in PENDING_POSTS.items() if v.get("ts", 0) < cutoff]:
+            PENDING_POSTS.pop(k, None)
+            
+    if len(READY_POSTS) > 200:
+        for k in [k for k, v in READY_POSTS.items() if v.get("ts", 0) < cutoff]:
+            READY_POSTS.pop(k, None)
+
+def truncate_text(text: str, max_len: int) -> str:
+    """Обрезает текст по границе предложения или пробела под лимиты Telegram."""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    last_space = cut.rfind(" ")
+    return cut[:last_space].strip() + "..." if last_space > 0 else cut.strip() + "..."
+
 def _get_link_char_ranges(raw_text: str, entities: list) -> list:
-    """Находит позиции всех скрытых ссылок (text_link, url, mention) в тексте."""
     if not raw_text or not entities:
         return []
     utf16_bytes = raw_text.encode("utf-16-le")
@@ -65,23 +89,20 @@ def _get_link_char_ranges(raw_text: str, entities: list) -> list:
     return ranges
 
 def clean_body_text(raw_text: str, entities: list = None) -> str:
-    """Отрезает чужие подписи и скрытые ссылки снизу сообщения."""
     if not raw_text:
         return ""
 
     link_ranges = _get_link_char_ranges(raw_text, entities or [])
     lines = raw_text.splitlines()
 
-    # Вычисляем символьные границы каждой строки для проверки скрытых ссылок
     line_bounds = []
     pos = 0
     for line in lines:
         start = pos
         end = pos + len(line)
         line_bounds.append((start, end))
-        pos = end + 1  # +1 на символ переноса \n
+        pos = end + 1
 
-    # Удаляем пустые строки и строки с чужими подписями/ссылками с конца
     while lines:
         last_line = lines[-1].strip()
         start_idx, end_idx = line_bounds[-1]
@@ -100,12 +121,12 @@ def clean_body_text(raw_text: str, entities: list = None) -> str:
 
 def build_final_post(clean_body: str, circle: str) -> str:
     if circle:
-        # Убираем чужие молнии/восклицательные знаки/кружки в самом начале, чтобы не было дублей
         stripped_body = LEADING_SYMBOLS_RE.sub("", clean_body).strip()
         body_with_circle = f"{circle} {stripped_body}"
     else:
         body_with_circle = clean_body
 
+    # Экранируем только тело, футер добавляем уже как HTML
     return f"{escape(body_with_circle)}{FOOTER_HTML}"
 
 def send_circle_selector(chat_id: int, post_data: dict):
@@ -117,18 +138,12 @@ def send_circle_selector(chat_id: int, post_data: dict):
                 {"text": "🟢", "callback_data": "circle_green"},
                 {"text": "⚪", "callback_data": "circle_white"}
             ],
-            [
-                {"text": "Без кружка", "callback_data": "circle_none"}
-            ]
+            [{"text": "Без кружка", "callback_data": "circle_none"}]
         ]
     }
     resp = requests.post(
         f"{API_URL}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": "Выбери кружок для начала сообщения:",
-            "reply_markup": keyboard
-        },
+        json={"chat_id": chat_id, "text": "Выбери кружок для начала сообщения:", "reply_markup": keyboard},
         timeout=10
     )
     if resp.status_code == 200:
@@ -136,13 +151,7 @@ def send_circle_selector(chat_id: int, post_data: dict):
         if prompt_msg_id:
             post_data["ts"] = time.time()
             PENDING_POSTS[f"{chat_id}_{prompt_msg_id}"] = post_data
-
-            # Очистка старых записей из памяти
-            if len(PENDING_POSTS) > 200:
-                cutoff = time.time() - 3600
-                old_keys = [k for k, v in PENDING_POSTS.items() if v.get("ts", 0) < cutoff]
-                for k in (old_keys or list(PENDING_POSTS.keys())[:50]):
-                    PENDING_POSTS.pop(k, None)
+            cleanup_memory()
 
 def handle_message(msg: dict):
     chat_id = msg["chat"]["id"]
@@ -152,13 +161,7 @@ def handle_message(msg: dict):
     if raw_text.strip() == "/start":
         requests.post(
             f"{API_URL}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": (
-                    "✅ Бот-редактор Дозор.ру (СПб) активен!\n\n"
-                    "Отправь или перешли сюда пост — затем выбери нужный кружок на кнопке."
-                )
-            },
+            json={"chat_id": chat_id, "text": "✅ Бот-редактор Дозор.ру (СПб) V3 активен!\nОтправь или перешли пост."},
             timeout=10
         )
         return
@@ -178,11 +181,7 @@ def handle_message(msg: dict):
 
     send_circle_selector(
         chat_id,
-        {
-            "clean_body": clean_body,
-            "media_type": media_type,
-            "file_id": file_id
-        }
+        {"clean_body": clean_body, "media_type": media_type, "file_id": file_id}
     )
 
 def handle_callback(cb: dict):
@@ -190,64 +189,84 @@ def handle_callback(cb: dict):
     data = cb.get("data", "")
     msg = cb.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
-    prompt_msg_id = msg.get("message_id")
+    msg_id = msg.get("message_id")
 
     if cb_id:
         requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
 
-    if not chat_id or not prompt_msg_id or data not in CIRCLE_MAP:
+    if not chat_id or not msg_id:
         return
 
-    key = f"{chat_id}_{prompt_msg_id}"
-    post_data = PENDING_POSTS.pop(key, None)
-    if not post_data:
+    # ШАГ 1: Выбор кружка
+    if data in CIRCLE_MAP:
+        key = f"{chat_id}_{msg_id}"
+        post_data = PENDING_POSTS.pop(key, None)
+        if not post_data:
+            return
+
+        # Удаляем сообщение с кнопками выбора кружка
+        requests.post(f"{API_URL}/deleteMessage", json={"chat_id": chat_id, "message_id": msg_id}, timeout=5)
+
+        circle = CIRCLE_MAP[data]
+        final_text = build_final_post(post_data["clean_body"], circle)
+        media_type = post_data["media_type"]
+        file_id = post_data["file_id"]
+
+        # Создаем короткий ID для кнопки (Unix time в мс)
+        post_key = str(int(time.time() * 1000))
+        READY_POSTS[post_key] = {"final_text": final_text, "media_type": media_type, "file_id": file_id, "ts": time.time()}
+        cleanup_memory()
+
+        pub_keyboard = {"inline_keyboard": [[{"text": "📢 Опубликовать в канал", "callback_data": f"pub_{post_key}"}]]}
+
+        # Отправляем превью админу
+        if media_type == "photo" and file_id:
+            requests.post(f"{API_URL}/sendPhoto", json={"chat_id": chat_id, "photo": file_id, "caption": final_text, "parse_mode": "HTML", "reply_markup": pub_keyboard}, timeout=15)
+        elif media_type == "video" and file_id:
+            requests.post(f"{API_URL}/sendVideo", json={"chat_id": chat_id, "video": file_id, "caption": final_text, "parse_mode": "HTML", "reply_markup": pub_keyboard}, timeout=15)
+        else:
+            requests.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": final_text, "parse_mode": "HTML", "disable_web_page_preview": True, "reply_markup": pub_keyboard}, timeout=15)
+        
         return
 
-    # Удаляем сообщение с кнопками выбора кружка
-    requests.post(
-        f"{API_URL}/deleteMessage",
-        json={"chat_id": chat_id, "message_id": prompt_msg_id},
-        timeout=5
-    )
+    # ШАГ 2: Публикация в канал
+    if data.startswith("pub_"):
+        post_key = data.replace("pub_", "")
+        post_data = READY_POSTS.pop(post_key, None)
+        
+        if not post_data:
+            requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "Пост устарел или уже опубликован", "show_alert": True}, timeout=5)
+            return
 
-    circle = CIRCLE_MAP[data]
-    final_text = build_final_post(post_data["clean_body"], circle)
-    media_type = post_data["media_type"]
-    file_id = post_data["file_id"]
+        final_text = post_data["final_text"]
+        media_type = post_data["media_type"]
+        file_id = post_data["file_id"]
 
-    if media_type == "photo" and file_id:
-        requests.post(
-            f"{API_URL}/sendPhoto",
-            json={
-                "chat_id": chat_id,
-                "photo": file_id,
-                "caption": final_text,
-                "parse_mode": "HTML"
-            },
-            timeout=15
-        )
-    elif media_type == "video" and file_id:
-        requests.post(
-            f"{API_URL}/sendVideo",
-            json={
-                "chat_id": chat_id,
-                "video": file_id,
-                "caption": final_text,
-                "parse_mode": "HTML"
-            },
-            timeout=15
-        )
-    else:
-        requests.post(
-            f"{API_URL}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": final_text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            },
-            timeout=15
-        )
+        success = False
+        error_msg = ""
+
+        # Проверка лимитов Telegram (4096 для текста, 1024 для подписи)
+        if media_type in ("photo", "video"):
+            safe_text = truncate_text(final_text, 1000) # 1000, чтобы точно влезло в 1024
+            if media_type == "photo":
+                resp = requests.post(f"{API_URL}/sendPhoto", json={"chat_id": CHANNEL_ID, "photo": file_id, "caption": safe_text, "parse_mode": "HTML"}, timeout=20)
+            else:
+                resp = requests.post(f"{API_URL}/sendVideo", json={"chat_id": CHANNEL_ID, "video": file_id, "caption": safe_text, "parse_mode": "HTML"}, timeout=20)
+        else:
+            safe_text = truncate_text(final_text, 4000) # 4000, чтобы точно влезло в 4096
+            resp = requests.post(f"{API_URL}/sendMessage", json={"chat_id": CHANNEL_ID, "text": safe_text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=20)
+
+        if resp.status_code == 200:
+            success = True
+        else:
+            error_msg = resp.text
+
+        # Редактируем кнопку у админа (убираем кнопку и ставим статус)
+        if success:
+            edit_markup = {"inline_keyboard": [[{"text": "✅ Опубликовано в канал", "callback_data": "none"}]]}
+            requests.post(f"{API_URL}/editMessageReplyMarkup", json={"chat_id": chat_id, "message_id": msg_id, "reply_markup": edit_markup}, timeout=10)
+        else:
+            requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": f"Ошибка публикации: {error_msg[:100]}", "show_alert": True}, timeout=5)
 
 def process_update(update: dict):
     if "message" in update:
@@ -257,7 +276,7 @@ def process_update(update: dict):
 
 def main():
     print("==================================================")
-    print("✅ Дозор СПб Репостер V2 (с выбором кружка) запущен!")
+    print("✅ Дозор СПб Репостер V3 (с публикацией) запущен!")
     print("==================================================")
 
     offset = 0
